@@ -2,21 +2,65 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { initializeApp } from 'firebase/app';
 import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
 import { getFirestore, doc, addDoc, onSnapshot, collection, query, serverTimestamp, setLogLevel } from 'firebase/firestore';
-import { Package, PlusCircle, Loader2, DollarSign, List, XCircle, Users } from 'lucide-react';
+import { Package, PlusCircle, Loader2, DollarSign, List, XCircle, Users, AlertTriangle } from 'lucide-react';
 
 // ----------------------
 // 1. FIREBASE SETUP
 // ----------------------
 
-// Ensure the global variables are defined or use placeholders for development
-const appId = typeof __app_id !== 'undefined' ? __app_id : 'fresh-eats-admin-dev';
-const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+// *** CRITICAL FALLBACK CONFIGURATION FOR EXTERNAL DEPLOYMENT ***
+// This mock config ensures the app loads when run on Render/public URLs 
+// where the Canvas-injected variables are missing.
+const FALLBACK_FIREBASE_CONFIG = {
+    apiKey: "MOCK_API_KEY", 
+    authDomain: "mock-auth-domain.firebaseapp.com",
+    projectId: "mock-project-id",
+    storageBucket: "mock-storage-bucket.appspot.com",
+    messagingSenderId: "MOCK_SENDER_ID",
+    appId: "MOCK_APP_ID"
+};
+
+const DEFAULT_APP_ID = 'fresh-eats-admin-dev'; // Used if __app_id is missing
+
+// Check for Canvas variables first, then fallback
+const appId = typeof __app_id !== 'undefined' ? __app_id : DEFAULT_APP_ID;
 const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+let firebaseConfig;
+let isFallback = true; // Assume fallback initially
+
+try {
+    // Attempt to use the platform config first
+    if (typeof __firebase_config !== 'undefined' && __firebase_config) {
+        // If the configuration is a string, parse it.
+        if (typeof __firebase_config === 'string') {
+            firebaseConfig = JSON.parse(__firebase_config);
+        } else {
+            // Handle case where it might already be an object
+            firebaseConfig = __firebase_config;
+        }
+        // Ensure the parsed config is valid before declaring success
+        if (firebaseConfig && firebaseConfig.projectId) {
+            isFallback = false;
+        } else {
+            // Fallback if config was present but invalid/empty
+            firebaseConfig = FALLBACK_FIREBASE_CONFIG;
+        }
+    } else {
+        // Fallback if the variable is entirely missing
+        firebaseConfig = FALLBACK_FIREBASE_CONFIG;
+    }
+} catch (e) {
+    // Fallback if parsing fails (e.g., malformed JSON string)
+    console.error("Error parsing __firebase_config, falling back:", e);
+    firebaseConfig = FALLBACK_FIREBASE_CONFIG;
+}
 
 // The collection path for public data (products)
 const getProductCollectionPath = (appId) => `/artifacts/${appId}/public/data/products`;
 
-setLogLevel('error'); // Set log level to reduce console noise unless debugging
+setLogLevel('error'); 
+
 
 let app;
 let db;
@@ -46,11 +90,20 @@ const App = () => {
 
   // --- Firebase Initialization and Auth ---
   useEffect(() => {
+    // Check for a usable config before attempting initialization
+    if (!firebaseConfig || !firebaseConfig.projectId || isFallback) {
+        // If we are using the fallback config, we simulate readiness and continue
+        // The error will be handled by the warning banner in renderProductForm
+        console.warn("Using fallback configuration. Running in Read-Only Mode.");
+        setIsAuthReady(true);
+        setLoading(false);
+        setUserId(`MOCK_USER_${crypto.randomUUID().substring(0, 8)}`); 
+        // We still need to populate with mock data if needed, but for now we just load empty.
+        return; 
+    }
+    
+    // Only proceed with real initialization if not using the fallback
     try {
-      if (!Object.keys(firebaseConfig).length) {
-        throw new Error("Firebase configuration is missing. Cannot initialize database.");
-      }
-
       app = initializeApp(firebaseConfig);
       db = getFirestore(app);
       auth = getAuth(app);
@@ -62,6 +115,7 @@ const App = () => {
         } else {
           // Attempt sign-in if not authenticated
           try {
+            // Use custom token if provided (e.g., in Canvas), otherwise sign in anonymously
             if (initialAuthToken) {
               await signInWithCustomToken(auth, initialAuthToken);
             } else {
@@ -69,7 +123,7 @@ const App = () => {
             }
           } catch (e) {
             console.error("Firebase Auth Error:", e);
-            setError(`Authentication failed: ${e.message}`);
+            setError("Authentication failed. Check token or rules.");
           }
         }
         setIsAuthReady(true);
@@ -78,17 +132,29 @@ const App = () => {
       return () => unsubscribeAuth();
     } catch (e) {
       console.error("Firebase Init Error:", e);
-      setError(`Initialization Error: ${e.message}`);
-      setIsAuthReady(true); // Mark ready to show error message
+      setError(`Initialization Error: ${e.message}. Check your configuration.`);
+      setIsAuthReady(true); 
     }
   }, []);
 
   // --- Firestore Listener ---
   useEffect(() => {
-    // Only proceed if Firebase is initialized and Auth is ready
-    if (!isAuthReady || !db || !userId) return;
+    // Do NOT proceed if auth is not ready or if there's an existing fatal error
+    if (!isAuthReady || error) return; 
 
-    const productsRef = collection(db, getProductCollectionPath(appId));
+    // If running in fallback mode, we skip fetching real data.
+    if (isFallback) {
+      setLoading(false);
+      return; 
+    }
+
+    // Only proceed if DB is initialized and we have a user ID (from successful auth)
+    if (!db || !userId) return;
+
+    // Use the actual appId for the data path
+    const dataAppId = appId;
+
+    const productsRef = collection(db, getProductCollectionPath(dataAppId));
     const productsQuery = query(productsRef);
 
     // Set up real-time listener for products
@@ -102,18 +168,21 @@ const App = () => {
         setLoading(false);
       } catch (e) {
         console.error("Firestore Snapshot Error:", e);
-        setError(`Data fetch failed: ${e.message}`);
+        setError(`Data fetch failed: ${e.message}. Please verify Firestore rules.`);
         setLoading(false);
       }
     }, (e) => {
       console.error("onSnapshot failed:", e);
-      setError(`Real-time data error: ${e.message}`);
+      // Only set error if it's a real Firebase error, not expected Read-Only behavior
+      if (!isFallback) { 
+        setError(`Real-time data error: ${e.message}. Please verify Firestore rules.`);
+      }
       setLoading(false);
     });
 
     // Cleanup function
     return () => unsubscribeSnapshot();
-  }, [isAuthReady, userId]); // Re-run when auth state changes
+  }, [isAuthReady, userId, error, isFallback]); 
 
   // --- Data Handlers ---
 
@@ -127,8 +196,15 @@ const App = () => {
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    if (isSubmitting || !db || !userId) return;
-
+    
+    // Block submission if not ready OR if using the mock config
+    if (isSubmitting || !db || !userId || !isAuthReady || isFallback) {
+        if (isFallback) {
+             setError("Write operation denied: Cannot write to Firestore when running outside Canvas. Data saving only works inside Canvas.");
+        }
+        return;
+    }
+    
     if (!newProduct.name || newProduct.price <= 0) {
       setError("Product name is required and price must be greater than 0.");
       return;
@@ -140,13 +216,12 @@ const App = () => {
       const collectionPath = getProductCollectionPath(appId);
       await addDoc(collection(db, collectionPath), {
         ...newProduct,
-        price: parseFloat(newProduct.price.toFixed(2)), // Ensure price is a number with 2 decimal places
+        price: parseFloat(newProduct.price.toFixed(2)), 
         available: true,
         createdAt: serverTimestamp(),
         createdBy: userId,
       });
 
-      // Clear the form and reset state
       setNewProduct({ name: '', description: '', price: 0, category: 'Main Dish' });
     } catch (e) {
       console.error("Error adding document: ", e);
@@ -228,7 +303,7 @@ const App = () => {
         </div>
         <button
           type="submit"
-          disabled={isSubmitting || !isAuthReady || !userId}
+          disabled={isSubmitting || !isAuthReady || !userId || isFallback}
           className="w-full flex justify-center py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition duration-150 ease-in-out disabled:opacity-50"
         >
           {isSubmitting ? (
@@ -239,10 +314,16 @@ const App = () => {
           ) : (
             <>
               <PlusCircle className="w-5 h-5 mr-2" />
-              Add Product
+              {isFallback ? 'Read-Only Mode' : 'Add Product'}
             </>
           )}
         </button>
+        {isFallback && (
+            <p className="text-xs text-red-500 mt-2 p-2 bg-red-50 border border-red-200 rounded-md flex items-center">
+                <AlertTriangle className="w-4 h-4 mr-1 flex-shrink-0" />
+                This app is in **Read-Only Mode**. Data saving is disabled because the required environment variables for Firebase were not found (expected when running outside Canvas, like on Render).
+            </p>
+        )}
       </form>
     </div>
   );
@@ -261,7 +342,7 @@ const App = () => {
       ) : products.length === 0 ? (
         <div className="text-center py-8 text-gray-500 border-2 border-dashed border-gray-200 rounded-md">
           <Package className="w-8 h-8 mx-auto mb-2" />
-          No products added yet. Use the form above to create one!
+          No products added yet.
         </div>
       ) : (
         <ul className="space-y-3">
@@ -272,7 +353,7 @@ const App = () => {
                 <p className="text-sm text-gray-500 italic">{product.description || 'No description provided.'}</p>
               </div>
               <div className="text-right">
-                <span className="font-bold text-lg text-indigo-600">${product.price.toFixed(2)}</span>
+                <span className="font-bold text-lg text-indigo-600">${product.price ? product.price.toFixed(2) : '0.00'}</span>
                 <span className="block text-xs text-gray-500 bg-gray-200 px-2 py-0.5 rounded-full mt-1">
                   {product.category}
                 </span>
@@ -294,8 +375,8 @@ const App = () => {
         <div className="text-sm text-gray-600 flex items-center space-x-2">
           <Users className="w-4 h-4 text-gray-500" />
           <span>Admin User:</span>
-          <span className="font-mono text-xs bg-gray-100 p-1 rounded">
-            {userId || 'Authenticating...'}
+          <span className="font-mono text-xs bg-gray-100 p-1 rounded break-all">
+            {userId || 'Mock ID...'}
           </span>
         </div>
       </div>
@@ -304,7 +385,7 @@ const App = () => {
 
   // --- Main Render ---
 
-  if (error) {
+  if (error && !isFallback) {
     return (
       <div className="min-h-screen flex items-center justify-center p-4 bg-red-50">
         <div className="bg-white p-6 rounded-lg shadow-xl border-l-4 border-red-500">
@@ -314,7 +395,7 @@ const App = () => {
           </h2>
           <p className="text-gray-700">{error}</p>
           <p className="text-sm mt-4 text-red-500">
-            Please ensure the global variables (`__app_id`, `__firebase_config`, `__initial_auth_token`) are correctly provided.
+            If this error persists, there may be an issue with Firebase rules or service availability.
           </p>
         </div>
       </div>
